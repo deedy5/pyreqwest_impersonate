@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 
 use ahash::RandomState;
@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use pyo3::exceptions;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use rquest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE};
 use rquest::impersonate::Impersonate;
 use rquest::multipart;
@@ -19,6 +20,12 @@ use response::Response;
 
 mod utils;
 use utils::{get_encoding_from_content, get_encoding_from_headers, json_dumps, url_encode};
+
+// Rayon global thread pool
+fn cpu_pool() -> &'static ThreadPool {
+    static CPU_POOL: OnceLock<ThreadPool> = OnceLock::new();
+    CPU_POOL.get_or_init(|| ThreadPoolBuilder::new().build().unwrap())
+}
 
 // Tokio global one-thread runtime
 fn runtime() -> &'static Runtime {
@@ -397,9 +404,19 @@ impl Client {
             Ok((buf, cookies, encoding, headers, status_code, url))
         };
 
-        // Execute an async future, releasing the Python GIL for concurrency.
-        // Use Tokio global runtime to block on the future.
-        let result = py.allow_threads(|| runtime().block_on(future));
+        // Execute an async future in Python, releasing the GIL for concurrency.
+        // Uses Rayon's global thread pool and Tokio global runtime to block on the future.
+        let (tx, rx) = mpsc::sync_channel(1);
+        py.allow_threads(|| {
+            cpu_pool().install(|| {
+                let result = runtime().block_on(future);
+                _ = tx.send(result);
+            });
+        });
+        let result = rx.recv().map_err(|e| {
+            PyErr::new::<exceptions::PyException, _>(format!("Error executing future: {}", e))
+        })?;
+
         let (f_buf, f_cookies, f_encoding, f_headers, f_status_code, f_url) = match result {
             Ok(value) => value,
             Err(e) => return Err(e),
