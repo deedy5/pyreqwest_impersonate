@@ -38,6 +38,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: stable
+          container: ghcr.io/rust-cross/manylinux_2_28-cross:${{ matrix.platform.target }}
           target: ${{ matrix.platform.target }}
           args: --release --out dist
           sccache: 'true'
